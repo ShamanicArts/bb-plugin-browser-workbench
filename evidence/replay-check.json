@@ -1,0 +1,28 @@
+{
+  "workspace": "/home/shamanic/dev/bb-stuff/browser-workbench-replay-check",
+  "workspaceName": "browser-workbench-759dfe9aeb",
+  "baseRevision": "0baa605b32a00619c1d7e3f32be6553ebcf8244a",
+  "patches": [
+    {
+      "file": "maintained-base.patch",
+      "sha256": "fe6a8c0db92433467bd4278dd016d6ebfdbb374edf113c3fd90a9c4b4b962832"
+    },
+    {
+      "file": "installed-image-copy.patch",
+      "sha256": "fcf4df2bef476db98f5b2459f333aa36bd5a0ed5c3e0873b621d41feca50bb45"
+    },
+    {
+      "file": "browser-workbench.patch",
+      "sha256": "cb45275a6273d7dc513095422d9cd17147a2c65e06fab8ff4cba595d98cdb5d4"
+    }
+  ],
+  "state": "source-identical-to-tested-candidate",
+  "installedChanged": false,
+  "verification": [
+    "pnpm install --frozen-lockfile",
+    "pnpm exec turbo run typecheck --filter=@bb/desktop --filter=@bb/sdk --filter=@get-bb/plugin-sdk --filter=@bb/cli --filter=@bb/server --filter=@bb/app --filter=@bb/host-daemon",
+    "pnpm exec turbo run test --filter=@bb/desktop -- test/browser-workbench.test.ts test/browser-graphics.test.ts test/desktop-browser-view-manager.test.ts test/desktop-browser-main-ipc.test.ts test/preload-browser-api.test.ts test/desktop-browser-broker.test.ts",
+    "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.mnemonicPrefix GIT_CONFIG_VALUE_0=false pnpm exec turbo run test --filter=@bb/host-workspace --env-mode=loose",
+    "pnpm exec turbo run build --filter=@bb/desktop"
+  ]
+}

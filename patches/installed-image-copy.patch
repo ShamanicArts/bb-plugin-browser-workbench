@@ -1,0 +1,523 @@
+diff --git a/apps/app/src/components/secondary-panel/FilePreview.tsx b/apps/app/src/components/secondary-panel/FilePreview.tsx
+index ee445e599..d92480f81 100644
+--- a/apps/app/src/components/secondary-panel/FilePreview.tsx
++++ b/apps/app/src/components/secondary-panel/FilePreview.tsx
+@@ -1048,7 +1048,26 @@ function FilePreviewImage({ url, alt }: FilePreviewImageProps) {
+   }, [alt, imageTabLightbox, url]);
+ 
+   return (
+-    <div className="pt-4">
++    <div
++      className="relative pt-4"
++      onKeyDown={(event) => {
++        if (
++          event.defaultPrevented ||
++          event.altKey ||
++          !(event.ctrlKey || event.metaKey) ||
++          event.key.toLowerCase() !== "c"
++        )
++          return;
++        const selection = document.getSelection();
++        if (selection && !selection.isCollapsed && selection.toString()) return;
++        event.preventDefault();
++        void copyToClipboardWithToast("", {
++          imageUrl: url,
++          successMessage: "Image copied",
++          errorMessage: "Failed to copy image",
++        });
++      }}
++    >
+       <button
+         type="button"
+         className="block w-full cursor-zoom-in"
+@@ -1063,6 +1082,16 @@ function FilePreviewImage({ url, alt }: FilePreviewImageProps) {
+       >
+         <img src={url} alt={alt} className="mx-auto block h-auto max-w-full" />
+       </button>
++      <CopyButton
++        key={url}
++        text=""
++        imageUrl={url}
++        label="Copy image"
++        successMessage="Image copied"
++        errorMessage="Failed to copy image"
++        className="absolute right-2 top-6 size-9 rounded-md bg-background/90 shadow-sm"
++        iconClassName="size-4"
++      />
+       {imageTabLightbox === null ? (
+         <ImageLightbox
+           title={alt}
+diff --git a/apps/app/src/components/ui/image-lightbox.interaction.test.tsx b/apps/app/src/components/ui/image-lightbox.interaction.test.tsx
+index 088d873b3..e99043223 100644
+--- a/apps/app/src/components/ui/image-lightbox.interaction.test.tsx
++++ b/apps/app/src/components/ui/image-lightbox.interaction.test.tsx
+@@ -1,8 +1,14 @@
+ // @vitest-environment jsdom
+ 
+ import { useState } from "react";
+-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+-import { afterEach, expect, it } from "vitest";
++import {
++  cleanup,
++  fireEvent,
++  render,
++  screen,
++  waitFor,
++} from "@testing-library/react";
++import { afterEach, expect, it, vi } from "vitest";
+ import { ImageLightbox } from "./image-lightbox";
+ 
+ function Preview() {
+@@ -26,7 +32,70 @@ function Preview() {
+   );
+ }
+ 
+-afterEach(cleanup);
++const originalClipboard = Object.getOwnPropertyDescriptor(
++  navigator,
++  "clipboard",
++);
++
++afterEach(() => {
++  cleanup();
++  vi.unstubAllGlobals();
++  if (originalClipboard)
++    Object.defineProperty(navigator, "clipboard", originalClipboard);
++  else Reflect.deleteProperty(navigator, "clipboard");
++});
++
++it("copies the current image through the button and keyboard after navigation", async () => {
++  const data: Record<string, Blob | Promise<Blob>>[] = [];
++  vi.stubGlobal(
++    "ClipboardItem",
++    class {
++      constructor(item: Record<string, Blob | Promise<Blob>>) {
++        data.push(item);
++      }
++    },
++  );
++  const fetchImage = vi
++    .fn()
++    .mockImplementation(
++      async () =>
++        new Response("pixels", { headers: { "Content-Type": "image/png" } }),
++    );
++  vi.stubGlobal("fetch", fetchImage);
++  const write = vi.fn(async () => {
++    await Promise.all(Object.values(data.at(-1)!));
++  });
++  Object.defineProperty(navigator, "clipboard", {
++    configurable: true,
++    value: { write },
++  });
++  render(<Preview />);
++  fireEvent.click(screen.getByRole("button", { name: "Open image" }));
++  fireEvent.click(screen.getByRole("button", { name: "Copy image" }));
++  await waitFor(() => expect(write).toHaveBeenCalledTimes(1));
++  expect(fetchImage).toHaveBeenLastCalledWith("/image-0.png");
++  expect(Object.keys(data[0])).toEqual(["image/png"]);
++  expect(screen.getByRole("dialog")).toBeTruthy();
++  fireEvent.click(screen.getByRole("button", { name: "Next image" }));
++  fireEvent.click(screen.getByRole("button", { name: "Copy image" }));
++  await waitFor(() => expect(write).toHaveBeenCalledTimes(2));
++  expect(fetchImage).toHaveBeenLastCalledWith("/image-1.png");
++  expect(Object.keys(data[1])).toEqual(["image/png"]);
++  expect(screen.getByRole("dialog")).toBeTruthy();
++  fireEvent.keyDown(window, { key: "c", metaKey: true });
++  await waitFor(() => expect(write).toHaveBeenCalledTimes(3));
++  const text = document.createElement("p");
++  text.textContent = "selected text";
++  document.body.append(text);
++  const range = document.createRange();
++  range.selectNodeContents(text);
++  document.getSelection()!.removeAllRanges();
++  document.getSelection()!.addRange(range);
++  expect(fireEvent.keyDown(window, { key: "c", ctrlKey: true })).toBe(true);
++  expect(write).toHaveBeenCalledTimes(3);
++  document.getSelection()!.removeAllRanges();
++  text.remove();
++});
+ 
+ it("dismisses from the image, backdrop, or close control without hiding the app root", () => {
+   const { container } = render(<Preview />);
+diff --git a/apps/app/src/components/ui/image-lightbox.test.ts b/apps/app/src/components/ui/image-lightbox.test.ts
+index eaffef0b9..3b826535a 100644
+--- a/apps/app/src/components/ui/image-lightbox.test.ts
++++ b/apps/app/src/components/ui/image-lightbox.test.ts
+@@ -27,6 +27,31 @@ function createKeyboardEvent(
+ }
+ 
+ describe("ImageLightbox", () => {
++  it("copies with Control or Command without requiring gallery navigation", () => {
++    for (const modifier of [{ ctrlKey: true }, { metaKey: true }]) {
++      expect(
++        getImageLightboxKeyAction({
++          event: createKeyboardEvent("c", modifier),
++          hasNavigation: false,
++        }),
++      ).toBe("copy");
++    }
++    expect(
++      getImageLightboxKeyAction({
++        event: createKeyboardEvent("c", {
++          ctrlKey: true,
++          defaultPrevented: true,
++        }),
++        hasNavigation: true,
++      }),
++    ).toBeNull();
++    expect(
++      getImageLightboxKeyAction({
++        event: createKeyboardEvent("ArrowRight", { ctrlKey: true }),
++        hasNavigation: true,
++      }),
++    ).toBeNull();
++  });
+   it("wraps image navigation in both directions", () => {
+     expect(
+       getWrappedImageIndex({
+diff --git a/apps/app/src/components/ui/image-lightbox.tsx b/apps/app/src/components/ui/image-lightbox.tsx
+index ef02f0473..20c837a1d 100644
+--- a/apps/app/src/components/ui/image-lightbox.tsx
++++ b/apps/app/src/components/ui/image-lightbox.tsx
+@@ -12,8 +12,10 @@ import { usePersistentOverlayFocus } from "@bb/shared-ui/responsive-overlay";
+ import { usePortalScopeProps } from "@bb/shared-ui/lib/portal-scope";
+ import { useBrowserDimmingOverlay } from "@/hooks/useBrowserDimmingModal";
+ import { Icon } from "@bb/shared-ui/icon";
++import { CopyButton } from "@/components/ui/copy-button";
++import { copyToClipboardWithToast } from "@/lib/clipboard";
+ 
+-type ImageLightboxKeyAction = "close" | "next" | "previous";
++type ImageLightboxKeyAction = "close" | "next" | "previous" | "copy";
+ 
+ const IMAGE_TRANSPARENCY_CHECKER_BASE =
+   "color-mix(in oklch, var(--ink) 5%, var(--canvas))";
+@@ -58,13 +60,9 @@ export function getImageLightboxKeyAction({
+   event,
+   hasNavigation,
+ }: ImageLightboxKeyActionInput): ImageLightboxKeyAction | null {
+-  if (
+-    event.defaultPrevented ||
+-    event.altKey ||
+-    event.ctrlKey ||
+-    event.metaKey
+-  ) {
+-    return null;
++  if (event.defaultPrevented || event.altKey) return null;
++  if (event.ctrlKey || event.metaKey) {
++    return event.key.toLowerCase() === "c" ? "copy" : null;
+   }
+ 
+   if (event.key === "Escape") {
+@@ -146,6 +144,21 @@ export function ImageLightbox({
+       }
+ 
+       switch (action) {
++        case "copy": {
++          const selection = document.getSelection();
++          if (
++            !imageSrc ||
++            (selection && !selection.isCollapsed && selection.toString())
++          )
++            return;
++          event.preventDefault();
++          void copyToClipboardWithToast("", {
++            imageUrl: imageSrc,
++            successMessage: "Image copied",
++            errorMessage: "Failed to copy image",
++          });
++          return;
++        }
+         case "close":
+           event.preventDefault();
+           onClose();
+@@ -177,6 +190,7 @@ export function ImageLightbox({
+     onPrevious,
+     nextDisabled,
+     previousDisabled,
++    imageSrc,
+   ]);
+ 
+   if (!isVisible) {
+@@ -258,6 +272,17 @@ export function ImageLightbox({
+         </p>
+       ) : null}
+ 
++      <CopyButton
++        key={imageSrc}
++        text=""
++        imageUrl={imageSrc ?? undefined}
++        label="Copy image"
++        successMessage="Image copied"
++        errorMessage="Failed to copy image"
++        disabled={!imageSrc}
++        className="absolute left-[max(0.5rem,env(safe-area-inset-left))] top-[max(0.5rem,env(safe-area-inset-top))] size-11 rounded-full bg-black/45 text-white hover:bg-black/60 hover:text-white"
++        iconClassName="size-5"
++      />
+       <Button
+         type="button"
+         variant="ghost"
+diff --git a/apps/desktop/src/desktop-browser-view.ts b/apps/desktop/src/desktop-browser-view.ts
+index 7b8857a2d..7b3817e31 100644
+--- a/apps/desktop/src/desktop-browser-view.ts
++++ b/apps/desktop/src/desktop-browser-view.ts
+@@ -780,6 +780,15 @@ export function createDesktopBrowserViewManager(
+       }
+       const { editFlags } = params;
+       const menu = Menu.buildFromTemplate([
++        ...(params.mediaType === "image" && params.hasImageContents
++          ? [
++              {
++                label: "Copy Image",
++                click: () => webContents.copyImageAt(params.x, params.y),
++              },
++              { type: "separator" as const },
++            ]
++          : []),
+         {
+           role: "cut",
+           enabled: editFlags.canCut,
+diff --git a/apps/desktop/src/desktop-context-menu.ts b/apps/desktop/src/desktop-context-menu.ts
+index 742239879..1c683fbb9 100644
+--- a/apps/desktop/src/desktop-context-menu.ts
++++ b/apps/desktop/src/desktop-context-menu.ts
+@@ -13,6 +13,7 @@ export interface DesktopContextMenuWebContents {
+     listener: (event: Event, params: ContextMenuParams) => void,
+   ): void;
+   replaceMisspelling(text: string): void;
++  copyImageAt(x: number, y: number): void;
+   session: Pick<
+     Session,
+     "addWordToSpellCheckerDictionary" | "setSpellCheckerEnabled"
+@@ -28,7 +29,7 @@ interface BuildDesktopContextMenuTemplateArgs {
+   params: ContextMenuParams;
+   webContents: Pick<
+     DesktopContextMenuWebContents,
+-    "replaceMisspelling" | "session"
++    "replaceMisspelling" | "copyImageAt" | "session"
+   >;
+ }
+ 
+@@ -111,6 +112,14 @@ export function buildDesktopContextMenuTemplate({
+     pushSeparatorIfNeeded(template);
+   }
+ 
++  if (params.mediaType === "image" && params.hasImageContents) {
++    template.push({
++      label: "Copy Image",
++      click: () => webContents.copyImageAt(params.x, params.y),
++    });
++    pushSeparatorIfNeeded(template);
++  }
++
+   if (params.isEditable) {
+     const { editFlags } = params;
+     template.push(
+diff --git a/apps/desktop/test/desktop-browser-view-manager.test.ts b/apps/desktop/test/desktop-browser-view-manager.test.ts
+index 69fe84b73..48c03c117 100644
+--- a/apps/desktop/test/desktop-browser-view-manager.test.ts
++++ b/apps/desktop/test/desktop-browser-view-manager.test.ts
+@@ -1,4 +1,9 @@
+-import type { RenderProcessGoneDetails, WebContentsView } from "electron";
++import type {
++  RenderProcessGoneDetails,
++  WebContentsView,
++  ContextMenuParams,
++  MenuItemConstructorOptions,
++} from "electron";
+ import { once } from "node:events";
+ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+ import { tmpdir } from "node:os";
+@@ -97,7 +102,10 @@ type FakeDidFailLoadListener = (
+   isMainFrame: boolean,
+ ) => void;
+ 
+-interface FakeContextMenuParams {
++interface FakeContextMenuParams extends Pick<
++  ContextMenuParams,
++  "mediaType" | "hasImageContents" | "x" | "y" | "selectionText"
++> {
+   editFlags: {
+     canCopy: boolean;
+     canCut: boolean;
+@@ -253,6 +261,9 @@ type FakeWindowOpenHandler = (
+ ) => FakeWindowOpenDecision;
+ 
+ const electronMock = vi.hoisted(() => {
++  const buildContextMenu = vi.fn((_template: MenuItemConstructorOptions[]) => ({
++    popup: vi.fn(),
++  }));
+   interface FakeNativeImage {
+     isEmpty(): boolean;
+     toJPEG(quality: number): Buffer;
+@@ -394,6 +405,11 @@ const electronMock = vi.hoisted(() => {
+     public readonly findInPageCalls: FakeFindInPageCall[] = [];
+     public readonly stopFindInPageCalls: string[] = [];
+     public reloadCalls = 0;
++    public copyImageAt = vi.fn();
++    emitContextMenu(params: FakeContextMenuParams): void {
++      for (const listener of this.listeners["context-menu"])
++        listener({}, params);
++    }
+     public readonly pendingCaptureResolvers: Array<
+       (image: FakeNativeImage) => void
+     > = [];
+@@ -787,6 +803,7 @@ const electronMock = vi.hoisted(() => {
+   return {
+     fakeCapturedImage,
+     fakeSessions,
++    buildContextMenu,
+     fakeViews,
+     fakeWindows,
+     createFakeWebContents() {
+@@ -819,6 +836,7 @@ const electronMock = vi.hoisted(() => {
+ });
+ 
+ vi.mock("electron", () => ({
++  Menu: { buildFromTemplate: electronMock.buildContextMenu },
+   BrowserWindow: electronMock.FakeBrowserWindow,
+   WebContentsView: electronMock.FakeWebContentsView,
+   session: electronMock.session,
+@@ -904,6 +922,7 @@ beforeEach(() => {
+   electronMock.fakeSessions.length = 0;
+   electronMock.fakeViews.length = 0;
+   electronMock.fakeWindows.length = 0;
++  electronMock.buildContextMenu.mockClear();
+ });
+ 
+ async function settlePendingCaptures(
+@@ -972,6 +991,53 @@ function requireFakeView(
+ }
+ 
+ describe("browser page scripts", () => {
++  it("copies images from an embedded browser page using native image data", () => {
++    const manager = createDesktopBrowserViewManager({
++      pagePreloadPath: "/app/dist/browser-page-preload.cjs",
++    });
++    const hostWindow = new FakeHostWindow({
++      contentBounds: { width: 700, height: 450 },
++      webContentsId: 91,
++    });
++    attachBrowserTab({
++      manager,
++      hostWindow,
++      tabId: "browser:a",
++      url: "https://example.com/",
++    });
++    const view = requireFakeView(0);
++    const params: FakeContextMenuParams = {
++      mediaType: "image",
++      hasImageContents: true,
++      x: 30,
++      y: 60,
++      selectionText: "",
++      editFlags: {
++        canCopy: false,
++        canCut: false,
++        canPaste: false,
++        canRedo: false,
++        canSelectAll: false,
++        canUndo: false,
++      },
++    };
++    view.webContents.emitContextMenu(params);
++    const template = electronMock.buildContextMenu.mock.calls[0]![0];
++    const copyImage = template.find((item) => item.label === "Copy Image");
++    expect(copyImage).toBeTruthy();
++    copyImage!.click?.(
++      undefined as never,
++      undefined as never,
++      undefined as never,
++    );
++    expect(view.webContents.copyImageAt).toHaveBeenCalledWith(30, 60);
++    view.webContents.emitContextMenu({ ...params, hasImageContents: false });
++    expect(
++      electronMock.buildContextMenu.mock.calls[1]![0].find(
++        (item) => item.label === "Copy Image",
++      ),
++    ).toBeUndefined();
++  });
+   it("awaits JSON values and binds the isolated bridge to the request channel", async () => {
+     const posted: Array<{ channel: string; data: unknown }> = [];
+     const isolated = await runInNewContext(
+diff --git a/apps/desktop/test/desktop-context-menu.test.ts b/apps/desktop/test/desktop-context-menu.test.ts
+index 0a1cff71d..6943b09df 100644
+--- a/apps/desktop/test/desktop-context-menu.test.ts
++++ b/apps/desktop/test/desktop-context-menu.test.ts
+@@ -51,11 +51,12 @@ const DEFAULT_MEDIA_FLAGS = {
+ 
+ interface FakeWebContents extends Pick<
+   DesktopContextMenuWebContents,
+-  "replaceMisspelling" | "session"
++  "replaceMisspelling" | "copyImageAt" | "session"
+ > {
+   addedDictionaryWords: string[];
+   replacedMisspellings: string[];
+   spellCheckerEnabledValues: boolean[];
++  copiedImages: [number, number][];
+ }
+ 
+ function createContextMenuParams(
+@@ -100,6 +101,10 @@ function createFakeWebContents(): FakeWebContents {
+     addedDictionaryWords,
+     replacedMisspellings,
+     spellCheckerEnabledValues,
++    copiedImages: [],
++    copyImageAt(x, y) {
++      this.copiedImages.push([x, y]);
++    },
+     replaceMisspelling(text) {
+       replacedMisspellings.push(text);
+     },
+@@ -120,6 +125,38 @@ function clickMenuItem(item: MenuItemConstructorOptions | undefined): void {
+ }
+ 
+ describe("desktop context menu", () => {
++  it("copies image pixels through Electron while retaining a separate link action", () => {
++    const webContents = createFakeWebContents();
++    const template = buildDesktopContextMenuTemplate({
++      webContents,
++      params: createContextMenuParams({
++        mediaType: "image",
++        hasImageContents: true,
++        linkURL: "https://example.com/page",
++        srcURL: "https://example.com/image.jpg",
++        x: 42,
++        y: 96,
++      }),
++    });
++    clickMenuItem(template.find((item) => item.label === "Copy Image"));
++    expect(webContents.copiedImages).toEqual([[42, 96]]);
++    expect(template.find((item) => item.label === "Copy Link")).toBeTruthy();
++  });
++
++  it("does not offer image copy for a broken image or other media", () => {
++    for (const params of [
++      createContextMenuParams({ mediaType: "image", hasImageContents: false }),
++      createContextMenuParams({ mediaType: "video", hasImageContents: true }),
++    ]) {
++      const template = buildDesktopContextMenuTemplate({
++        webContents: createFakeWebContents(),
++        params,
++      });
++      expect(
++        template.find((item) => item.label === "Copy Image"),
++      ).toBeUndefined();
++    }
++  });
+   it("uses Electron's spelling result even when spellcheckEnabled is false", () => {
+     const webContents = createFakeWebContents();
+     const params = createContextMenuParams({
+diff --git a/apps/desktop/test/desktop-window-factory.test.ts b/apps/desktop/test/desktop-window-factory.test.ts
+index 78b692522..bd58a3bc7 100644
+--- a/apps/desktop/test/desktop-window-factory.test.ts
++++ b/apps/desktop/test/desktop-window-factory.test.ts
+@@ -88,6 +88,8 @@ class FakeDesktopWindowWebContents implements DesktopWindowWebContents {
+     this.replacedMisspellings.push(text);
+   }
+ 
++  copyImageAt(): void {}
++
+   setWindowOpenHandler(handler: DesktopWindowOpenHandler): void {
+     this.windowOpenHandler = handler;
+   }

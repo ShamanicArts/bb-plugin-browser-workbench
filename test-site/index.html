@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Workbench test page</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script>
+  // Early errors: these fire before the page finishes loading.
+  console.info("[boot] test page loading");
+  console.warn("[boot] deprecated option `legacyAudio` used");
+  setTimeout(() => { throw new Error("[boot] uncaught error during load"); }, 0);
+</script>
+<style>
+  :root{color-scheme:dark;font:14px/1.5 system-ui,sans-serif;background:#111318;color:#e6e8ee}
+  main{max-width:900px;margin:0 auto;padding:24px}
+  h1{font-size:20px;margin:0 0 4px} p{color:#9aa1b2;margin:0 0 16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+  button{background:#1e222b;color:inherit;border:1px solid #2c3240;border-radius:8px;padding:10px 12px;text-align:left;cursor:pointer}
+  button:hover{border-color:#4b5568}
+  pre{background:#0b0d11;border:1px solid #232835;border-radius:8px;padding:10px;max-height:220px;overflow:auto;font-size:12px}
+  canvas{width:100%;height:140px;border-radius:8px;background:#000;display:block;margin-top:10px}
+</style></head>
+<body><main>
+<h1>Workbench test page</h1>
+<p>Requests devices, makes console noise, throws, and renders with WebGL and WebGPU.</p>
+<div class="grid">
+  <button id="mic">Request microphone</button>
+  <button id="cam">Request camera</button>
+  <button id="midi">Request Web MIDI</button>
+  <button id="sysex">Request MIDI SysEx</button>
+  <button id="notify">Request notifications</button>
+  <button id="geo">Request location</button>
+  <button id="spam">Console burst (log/info/warn/error ×)</button>
+  <button id="repeat">Repeat the same warning ×20</button>
+  <button id="throw">Throw uncaught error</button>
+  <button id="reject">Unhandled promise rejection</button>
+  <button id="gl">Render with WebGL</button>
+  <button id="gpu">Render with WebGPU</button>
+</div>
+<canvas id="canvas" width="800" height="140"></canvas>
+<pre id="out"></pre>
+</main>
+<script>
+const out = document.getElementById("out");
+const log = (msg) => { out.textContent = `${new Date().toLocaleTimeString()}  ${msg}\n` + out.textContent; console.log(msg); };
+const fail = (what) => (e) => { log(`${what} failed: ${e.name}: ${e.message}`); console.error(`${what} failed`, e); };
+const on = (id, fn) => document.getElementById(id).addEventListener("click", fn);
+
+on("mic", () => navigator.mediaDevices.getUserMedia({audio:true}).then(s => { log(`microphone OK: ${s.getAudioTracks()[0].label}`); setTimeout(()=>s.getTracks().forEach(t=>t.stop()),3000); }, fail("microphone")));
+on("cam", () => navigator.mediaDevices.getUserMedia({video:true}).then(s => { log(`camera OK: ${s.getVideoTracks()[0].label}`); s.getTracks().forEach(t=>t.stop()); }, fail("camera")));
+on("midi", () => navigator.requestMIDIAccess().then(m => log(`MIDI OK: ${m.inputs.size} inputs, ${m.outputs.size} outputs`), fail("MIDI")));
+on("sysex", () => navigator.requestMIDIAccess({sysex:true}).then(m => log(`MIDI SysEx OK: ${m.inputs.size} inputs`), fail("MIDI SysEx")));
+on("notify", () => Notification.requestPermission().then(p => log(`notifications: ${p}`), fail("notifications")));
+on("geo", () => navigator.geolocation.getCurrentPosition(p => log(`location OK: ${p.coords.latitude.toFixed(2)}`), e => { log(`location failed: ${e.message}`); console.error("location failed", e.message); }));
+on("spam", () => { for (let i = 1; i <= 4; i++) { console.log(`log ${i}`, {i}); console.info(`info ${i}`); console.debug(`debug ${i}`); } console.warn("a warning with a long message that should wrap nicely in the dock rather than overflow horizontally ".repeat(2)); console.error(new TypeError("Cannot read properties of undefined (reading 'connect')")); log("console burst sent"); });
+on("repeat", () => { for (let i = 0; i < 20; i++) console.warn("AudioContext was not allowed to start"); log("20 identical warnings sent"); });
+on("throw", () => { setTimeout(() => { undefinedFunctionCall(); }); log("throwing"); });
+on("reject", () => { Promise.reject(new Error("unhandled rejection from test page")); log("rejected"); });
+// A canvas keeps its first context type, so each renderer gets a fresh one.
+function freshCanvas() {
+  const c = document.createElement("canvas"); c.width = 800; c.height = 140;
+  document.getElementById("canvas").replaceWith(c); c.id = "canvas";
+  return c;
+}
+on("gl", () => {
+  const c = freshCanvas(); const gl = c.getContext("webgl2") || c.getContext("webgl");
+  if (!gl) return fail("WebGL")(new Error("no WebGL context"));
+  gl.clearColor(0.2, 0.5, 0.9, 1); gl.clear(gl.COLOR_BUFFER_BIT); log(`WebGL OK: ${gl.getParameter(gl.VERSION)}`);
+});
+on("gpu", async () => {
+  try {
+    if (!navigator.gpu) throw new Error("navigator.gpu missing");
+    const adapter = await navigator.gpu.requestAdapter(); if (!adapter) throw new Error("no adapter");
+    const device = await adapter.requestDevice();
+    const c = freshCanvas();
+    const ctx = c.getContext("webgpu"); const format = navigator.gpu.getPreferredCanvasFormat(); ctx.configure({device, format});
+    const enc = device.createCommandEncoder();
+    enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:0.9,g:0.3,b:0.5,a:1},loadOp:"clear",storeOp:"store"}]}).end();
+    device.queue.submit([enc.finish()]); log(`WebGPU OK: ${adapter.info?.vendor || "adapter"} ${adapter.info?.architecture || ""}`);
+  } catch (e) { fail("WebGPU")(e); }
+});
+log("ready");
+</script></body></html>

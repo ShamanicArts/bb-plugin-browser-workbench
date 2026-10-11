@@ -1,0 +1,41 @@
+{
+  "format": 1,
+  "baseRevision": "0baa605b32a00619c1d7e3f32be6553ebcf8244a",
+  "baseRelease": "desktop-v0.44.0",
+  "maintainedBaseRevision": "0139cf1b7846d78dc3992d031f706ef9275be885",
+  "nativeRevision": "0b6a828445cc51a2a41379173e056f1b44f59a2d",
+  "nativeChangeId": "nnlwpylslpporpunkssomywpswtttvxu",
+  "patches": [
+    {
+      "file": "maintained-base.patch",
+      "sha256": "fe6a8c0db92433467bd4278dd016d6ebfdbb374edf113c3fd90a9c4b4b962832"
+    },
+    {
+      "file": "installed-image-copy.patch",
+      "sha256": "fcf4df2bef476db98f5b2459f333aa36bd5a0ed5c3e0873b621d41feca50bb45"
+    },
+    {
+      "file": "browser-workbench.patch",
+      "sha256": "fd346057720279c54b489a17d4cd40287b5adead789dc302ad548b1154c9fa86"
+    },
+    {
+      "file": "runtime-outlives-window.patch",
+      "sha256": "a4ff83b9b7fc11add0bf0884f4c635bec587245ce13d47c20c8bf45994ea4d17"
+    }
+  ],
+  "verification": [
+    "pnpm install --frozen-lockfile",
+    "pnpm exec turbo run typecheck --filter=@bb/desktop --filter=@bb/sdk --filter=@get-bb/plugin-sdk --filter=@bb/cli --filter=@bb/server --filter=@bb/app --filter=@bb/host-daemon",
+    "pnpm exec turbo run test --filter=@bb/desktop -- test/browser-workbench.test.ts test/browser-workbench-repl.test.ts test/owned-runtime-supervisor.test.ts test/browser-graphics.test.ts test/desktop-browser-view-manager.test.ts test/desktop-browser-main-ipc.test.ts test/preload-browser-api.test.ts test/desktop-browser-broker.test.ts",
+    "env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.mnemonicPrefix GIT_CONFIG_VALUE_0=false pnpm exec turbo run test --filter=@bb/host-workspace --env-mode=loose",
+    "pnpm exec turbo run build --filter=@bb/desktop"
+  ],
+  "state": "desktop-only-installed",
+  "toolchain": {
+    "node": "22.19.0",
+    "pnpm": "9.15.0"
+  },
+  "runtimeFixRevision": "e854c117730c71111808e2d73cb821b7a12aa4fb",
+  "runtimeFixChangeId": "mkxuuvrulmrvymwnlovsyzyrrrrlwznl",
+  "deployRevision": "7902aa05f05338f9d7627a958493e29a3aaf2805"
+}

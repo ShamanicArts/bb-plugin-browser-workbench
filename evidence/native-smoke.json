@@ -1,0 +1,22 @@
+{
+  "ok": true,
+  "electron": "44.3.0",
+  "denied": {
+    "allowed": false,
+    "error": "NotAllowedError"
+  },
+  "microphone": {
+    "allowed": true,
+    "tracks": 1
+  },
+  "camera": {
+    "allowed": false,
+    "error": "NotAllowedError"
+  },
+  "blocked": {
+    "allowed": false,
+    "error": "NotAllowedError"
+  },
+  "earlyConsoleCaptured": true,
+  "permissionScope": "tab-origin"
+}

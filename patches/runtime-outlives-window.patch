@@ -1,0 +1,496 @@
+diff --git a/apps/desktop/src/bb-app-bridge-stdio-guard.ts b/apps/desktop/src/bb-app-bridge-stdio-guard.ts
+new file mode 100644
+index 0000000000..71118df3ad
+--- /dev/null
++++ b/apps/desktop/src/bb-app-bridge-stdio-guard.ts
+@@ -0,0 +1,11 @@
++function ignoreClosedPipe(stream: NodeJS.WriteStream): void {
++  stream.on("error", (error: NodeJS.ErrnoException) => {
++    if (error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED") {
++      return;
++    }
++    throw error;
++  });
++}
++
++ignoreClosedPipe(process.stdout);
++ignoreClosedPipe(process.stderr);
+diff --git a/apps/desktop/src/bb-app-bridge.ts b/apps/desktop/src/bb-app-bridge.ts
+index 1a203e17de..1c823ff95e 100644
+--- a/apps/desktop/src/bb-app-bridge.ts
++++ b/apps/desktop/src/bb-app-bridge.ts
+@@ -1,1 +1,2 @@
++import "./bb-app-bridge-stdio-guard.js";
+ import "bb-app/dist/bb-app.js";
+diff --git a/apps/desktop/src/main.ts b/apps/desktop/src/main.ts
+index 861f8474e8..c200afe6b1 100644
+--- a/apps/desktop/src/main.ts
++++ b/apps/desktop/src/main.ts
+@@ -28,6 +28,7 @@
+   APP_SURFACE_ENV_NAME,
+ } from "@bb/config/app-surface";
+ import { findMachineServiceFile } from "@bb/config/machine-service";
++import { isProcessRunning } from "@bb/config/verified-process-stop";
+ import {
+   deriveConnectBaseUrl,
+   type ConnectCredential,
+@@ -90,6 +91,7 @@
+ } from "./desktop-menu-shortcuts.js";
+ import {
+   clearOwnedRuntimePidFile,
++  inspectOwnedRuntime,
+   reapStaleOwnedRuntime,
+   writeOwnedRuntimePidFile,
+ } from "./owned-runtime-supervisor.js";
+@@ -290,6 +292,13 @@
+ const OWNED_RUNTIME_KILL_TIMEOUT_MS = 1_000;
+ const FOREIGN_RUNTIME_STOP_TIMEOUT_MS = 15_000;
+ const FOREIGN_RUNTIME_KILL_TIMEOUT_MS = 3_000;
++const ADOPT_PROBE_TIMEOUT_MS = 5_000;
++const ADOPT_PROBE_ATTEMPTS = 3;
++const ADOPT_PROBE_RETRY_DELAY_MS = 1_000;
++const ADOPTED_RUNTIME_WATCH_INTERVAL_MS = 2_000;
++const APP_RENDERER_RECOVERY_DELAY_MS = 1_000;
++const APP_RENDERER_RECOVERY_WINDOW_MS = 60_000;
++const APP_RENDERER_RECOVERY_MAX_ATTEMPTS = 3;
+ const REMOTE_SYSTEM_CONFIG_POLL_INTERVAL_MS = 5 * 60 * 1000;
+ 
+ interface DesktopRuntime {
+@@ -422,6 +431,13 @@
+ let connectSignInWindow: BrowserWindow | null = null;
+ let stoppingForQuit = false;
+ let quitting = false;
++interface AdoptedOwnedRuntime {
++  pid: number;
++  serverUrl: string;
++  userDataPath: string;
++}
++let adoptedOwnedRuntime: AdoptedOwnedRuntime | null = null;
++let adoptedRuntimeWatchTimer: NodeJS.Timeout | null = null;
+ let serverTargetStore: ServerTargetStore | null = null;
+ let connectServerSync: ConnectServerSync | null = null;
+ let connectCredentialCache: ConnectCredentialCache | null = null;
+@@ -575,6 +591,44 @@
+   }
+ }
+ 
++function registerApplicationRendererCrashRecovery(
++  webContents: WebContents,
++): void {
++  const recentCrashes: number[] = [];
++  webContents.on("render-process-gone", (_event, details) => {
++    if (quitting || details.reason === "clean-exit") {
++      return;
++    }
++    const now = Date.now();
++    while (
++      recentCrashes.length > 0 &&
++      now - (recentCrashes[0] ?? now) > APP_RENDERER_RECOVERY_WINDOW_MS
++    ) {
++      recentCrashes.shift();
++    }
++    recentCrashes.push(now);
++    if (recentCrashes.length > APP_RENDERER_RECOVERY_MAX_ATTEMPTS) {
++      desktopLogger.error(
++        `[desktop] application window renderer died again (${details.reason}, exit code ${String(details.exitCode)}); not reloading it automatically. The bb server keeps running; reload the window to reconnect.`,
++      );
++      return;
++    }
++    desktopLogger.warn(
++      `[desktop] application window renderer died (${details.reason}, exit code ${String(details.exitCode)}); reloading it. The bb server keeps running.`,
++    );
++    setTimeout(() => {
++      if (quitting || webContents.isDestroyed()) {
++        return;
++      }
++      const browserWindow = resolveApplicationWindow(webContents);
++      if (browserWindow !== null) {
++        desktopBrowserViewManager?.prepareWindowReload(browserWindow);
++      }
++      webContents.reload();
++    }, APP_RENDERER_RECOVERY_DELAY_MS);
++  });
++}
++
+ function registerApplicationRendererReloadShortcut(
+   webContents: WebContents,
+ ): void {
+@@ -1143,6 +1197,9 @@
+   registerApplicationRendererReloadShortcut(
+     (browserWindow as BrowserWindow).webContents,
+   );
++  registerApplicationRendererCrashRecovery(
++    (browserWindow as BrowserWindow).webContents,
++  );
+   registerDesktopContextMenu({ webContents: browserWindow.webContents });
+   browserWindow.on("enter-full-screen", () => {
+     sendDesktopWindowStateChanged(browserWindow);
+@@ -2204,6 +2261,7 @@
+   const runtime = currentRuntime;
+   if (runtime === null || runtime.ownership !== "spawned") {
+     setCurrentRuntime(null);
++    await stopAdoptedOwnedRuntime();
+     return;
+   }
+ 
+@@ -2422,6 +2480,126 @@
+   });
+ }
+ 
++interface FindAdoptableOwnedRuntimeArgs {
++  bridgePath: string;
++  dataDir: string;
++  serverUrl: string;
++  userDataPath: string;
++}
++
++function sameServerHost(left: string, right: string): boolean {
++  try {
++    return new URL(left).host === new URL(right).host;
++  } catch {
++    return false;
++  }
++}
++
++async function findAdoptableOwnedRuntime(
++  args: FindAdoptableOwnedRuntimeArgs,
++): Promise<AdoptedOwnedRuntime | null> {
++  if (process.env.BB_DESKTOP_ADOPT_OWNED_RUNTIME === "0") {
++    return null;
++  }
++  const inspection = await inspectOwnedRuntime({
++    userDataPath: args.userDataPath,
++  });
++  if (inspection.kind !== "running") {
++    return null;
++  }
++  const { pidFile } = inspection;
++  if (
++    pidFile.bridgePath !== args.bridgePath ||
++    !sameServerHost(pidFile.serverUrl, args.serverUrl)
++  ) {
++    desktopLogger.info(
++      `[desktop] not re-attaching to bb-app process ${String(pidFile.pid)}: it was started by a different build or for a different server URL`,
++    );
++    return null;
++  }
++  for (let attempt = 1; attempt <= ADOPT_PROBE_ATTEMPTS; attempt += 1) {
++    const probe = await probeBbServer({
++      serverUrl: args.serverUrl,
++      timeoutMs: ADOPT_PROBE_TIMEOUT_MS,
++    });
++    if (probe.kind === "compatible") {
++      if (
++        probe.dataDir !== null &&
++        resolve(probe.dataDir) !== resolve(args.dataDir)
++      ) {
++        desktopLogger.info(
++          `[desktop] not re-attaching to bb-app process ${String(pidFile.pid)}: it serves data dir ${probe.dataDir}, not ${args.dataDir}`,
++        );
++        return null;
++      }
++      return {
++        pid: pidFile.pid,
++        serverUrl: args.serverUrl,
++        userDataPath: args.userDataPath,
++      };
++    }
++    if (probe.kind === "incompatible") {
++      return null;
++    }
++    if (attempt < ADOPT_PROBE_ATTEMPTS) {
++      await new Promise<void>((resolvePromise) => {
++        setTimeout(resolvePromise, ADOPT_PROBE_RETRY_DELAY_MS);
++      });
++    }
++  }
++  return null;
++}
++
++function stopAdoptedRuntimeWatcher(): void {
++  if (adoptedRuntimeWatchTimer !== null) {
++    clearInterval(adoptedRuntimeWatchTimer);
++    adoptedRuntimeWatchTimer = null;
++  }
++}
++
++function watchAdoptedOwnedRuntime(
++  adopted: AdoptedOwnedRuntime,
++  runtime: DesktopRuntime,
++): void {
++  stopAdoptedRuntimeWatcher();
++  const timer = setInterval(() => {
++    if (isProcessRunning(adopted.pid)) {
++      return;
++    }
++    stopAdoptedRuntimeWatcher();
++    if (adoptedOwnedRuntime === adopted) {
++      adoptedOwnedRuntime = null;
++    }
++    void clearOwnedRuntimePidFile({ userDataPath: adopted.userDataPath });
++    if (quitting || currentRuntime !== runtime) {
++      return;
++    }
++    setCurrentRuntime(null);
++    void loadStartupError({
++      details: `The bb-app process this window re-attached to after a restart (pid ${String(adopted.pid)}) stopped.`,
++      logs: "",
++      actions: [],
++      title: "bb stopped",
++    });
++  }, ADOPTED_RUNTIME_WATCH_INTERVAL_MS);
++  timer.unref();
++  adoptedRuntimeWatchTimer = timer;
++}
++
++async function stopAdoptedOwnedRuntime(): Promise<void> {
++  const adopted = adoptedOwnedRuntime;
++  if (adopted === null) {
++    return;
++  }
++  adoptedOwnedRuntime = null;
++  stopAdoptedRuntimeWatcher();
++  await reapStaleOwnedRuntime({
++    signal: "SIGTERM",
++    timeoutMs: OWNED_RUNTIME_STOP_TIMEOUT_MS,
++    userDataPath: adopted.userDataPath,
++  });
++}
++
+ async function spawnOwnedRuntime(
+   args: StartOwnedRuntimeArgs,
+ ): Promise<OwnedRuntime> {
+@@ -2647,6 +2825,35 @@
+     timeoutMs: ATTACH_PROBE_TIMEOUT_MS,
+   });
+ 
++  const adopted = adoptedOwnedRuntime;
++  if (adopted !== null && existingProbe.kind !== "compatible") {
++    await stopAdoptedOwnedRuntime();
++  }
++
++  const reattach = adoptedOwnedRuntime;
++  if (existingProbe.kind === "compatible" && reattach !== null) {
++    const adoptedRuntime: DesktopRuntime = {
++      bbProcess: null,
++      ownership: "attached",
++      serverUrl: existingProbe.serverUrl,
++      userDataPath: args.userDataPath,
++    };
++    desktopLogger.info(
++      `[desktop] re-attached to the running bb-app process ${String(reattach.pid)} left by a previous desktop instance`,
++    );
++    setCurrentRuntime(adoptedRuntime);
++    watchAdoptedOwnedRuntime(reattach, adoptedRuntime);
++    await loadBbApp(
++      resolveDesktopWindowUrl({
++        env: process.env,
++        serverUrl: existingProbe.serverUrl,
++      }),
++    );
++    startSystemConfigSync(existingProbe.serverUrl);
++    refreshApplicationMenu();
++    return;
++  }
++
+   if (existingProbe.kind === "compatible") {
+     const decision = await decideOnExistingServer(existingProbe);
+     if (decision === "quit") {
+@@ -2872,11 +3079,19 @@
+   ) {
+     app.dock.setIcon(iconPath);
+   }
+-  await reapStaleOwnedRuntime({
+-    signal: "SIGTERM",
+-    timeoutMs: 5_000,
++  adoptedOwnedRuntime = await findAdoptableOwnedRuntime({
++    bridgePath,
++    dataDir: resolveDataDirFromEnv({ env: process.env, homeDir: homedir() }),
++    serverUrl,
+     userDataPath,
+   });
++  if (adoptedOwnedRuntime === null) {
++    await reapStaleOwnedRuntime({
++      signal: "SIGTERM",
++      timeoutMs: 5_000,
++      userDataPath,
++    });
++  }
+ 
+   serverTargetStore = createServerTargetStore({
+     storagePath: join(userDataPath, SERVER_TARGET_FILE_NAME),
+diff --git a/apps/desktop/src/owned-runtime-supervisor.ts b/apps/desktop/src/owned-runtime-supervisor.ts
+index e67a440348..6f84b2c9df 100644
+--- a/apps/desktop/src/owned-runtime-supervisor.ts
++++ b/apps/desktop/src/owned-runtime-supervisor.ts
+@@ -4,6 +4,7 @@
+ import {
+   createNodeVerifiedProcessOps,
+   stopVerifiedProcess,
++  verifyProcessIdentity,
+   type VerifiedProcessOps,
+ } from "@bb/config/verified-process-stop";
+ import { z } from "zod";
+@@ -25,7 +26,7 @@
+   | ReapedStaleOwnedRuntimeResult
+   | SkippedStaleOwnedRuntimeResult;
+ 
+-interface OwnedRuntimePidFile {
++export interface OwnedRuntimePidFile {
+   bridgePath: string;
+   pid: number;
+   serverUrl: string;
+@@ -182,3 +183,38 @@
+     pid: pidFile.pid,
+   };
+ }
++
++interface InspectOwnedRuntimeArgs {
++  processOps?: VerifiedProcessOps;
++  userDataPath: string;
++}
++
++export type OwnedRuntimeInspection =
++  | { kind: "no-pid-file" }
++  | { kind: "not-running"; pidFile: OwnedRuntimePidFile }
++  | { kind: "running"; pidFile: OwnedRuntimePidFile }
++  | { kind: "unverified"; pidFile: OwnedRuntimePidFile };
++
++export async function inspectOwnedRuntime(
++  args: InspectOwnedRuntimeArgs,
++): Promise<OwnedRuntimeInspection> {
++  const processOps = args.processOps ?? createNodeVerifiedProcessOps();
++  const pidFile = await readOwnedRuntimePidFile({
++    userDataPath: args.userDataPath,
++  });
++  if (pidFile === null) {
++    return { kind: "no-pid-file" };
++  }
++  if (!processOps.isRunning(pidFile.pid)) {
++    return { kind: "not-running", pidFile };
++  }
++  const mismatch = await verifyProcessIdentity({
++    pid: pidFile.pid,
++    processOps,
++    startedAt: pidFile.startedAt,
++    verifyTokens: [pidFile.bridgePath],
++  });
++  return mismatch === null
++    ? { kind: "running", pidFile }
++    : { kind: "unverified", pidFile };
++}
+diff --git a/apps/desktop/test/owned-runtime-supervisor.test.ts b/apps/desktop/test/owned-runtime-supervisor.test.ts
+index e975107029..76bf3db2a6 100644
+--- a/apps/desktop/test/owned-runtime-supervisor.test.ts
++++ b/apps/desktop/test/owned-runtime-supervisor.test.ts
+@@ -29,6 +29,7 @@
+   WaitForProcessExitArgs,
+ } from "@bb/config/verified-process-stop";
+ import {
++  inspectOwnedRuntime,
+   readOwnedRuntimePidFile,
+   reapStaleOwnedRuntime,
+   writeOwnedRuntimePidFile,
+@@ -222,4 +223,81 @@
+       readOwnedRuntimePidFile({ userDataPath: tempDir.path }),
+     ).resolves.toBeNull();
+   });
++  it("reports a live owned bridge without signalling it", async () => {
++    const tempDir = await createTempDir();
++    const bridgePath =
++      "/opt/bb/resources/app.asar.unpacked/dist/bb-app-bridge.mjs";
++    const fakeProcessOps = createFakeProcessOps({
++      command: `/opt/bb/bb ${bridgePath}`,
++      running: true,
++    });
++    await writeOwnedRuntimePidFile({
++      bridgePath,
++      pid: 12345,
++      serverUrl: "http://127.0.0.1:38886",
++      userDataPath: tempDir.path,
++    });
++
++    const inspection = await inspectOwnedRuntime({
++      processOps: fakeProcessOps.ops,
++      userDataPath: tempDir.path,
++    });
++
++    expect(inspection).toMatchObject({
++      kind: "running",
++      pidFile: { bridgePath, pid: 12345 },
++    });
++    expect(fakeProcessOps.killedSignals).toEqual([]);
++    await expect(
++      readOwnedRuntimePidFile({ userDataPath: tempDir.path }),
++    ).resolves.not.toBeNull();
++  });
++
++  it("does not treat a reused PID as the owned bridge", async () => {
++    const tempDir = await createTempDir();
++    const fakeProcessOps = createFakeProcessOps({
++      command: "/usr/bin/vim",
++      running: true,
++    });
++    await writeOwnedRuntimePidFile({
++      bridgePath: "/opt/bb/bb-app-bridge.mjs",
++      pid: 12345,
++      serverUrl: "http://127.0.0.1:38886",
++      userDataPath: tempDir.path,
++    });
++
++    await expect(
++      inspectOwnedRuntime({
++        processOps: fakeProcessOps.ops,
++        userDataPath: tempDir.path,
++      }),
++    ).resolves.toMatchObject({ kind: "unverified" });
++  });
++
++  it("reports a dead or missing owned bridge", async () => {
++    const tempDir = await createTempDir();
++    const fakeProcessOps = createFakeProcessOps({
++      command: null,
++      running: false,
++    });
++    await expect(
++      inspectOwnedRuntime({
++        processOps: fakeProcessOps.ops,
++        userDataPath: tempDir.path,
++      }),
++    ).resolves.toEqual({ kind: "no-pid-file" });
++
++    await writeOwnedRuntimePidFile({
++      bridgePath: "/opt/bb/bb-app-bridge.mjs",
++      pid: 12345,
++      serverUrl: "http://127.0.0.1:38886",
++      userDataPath: tempDir.path,
++    });
++    await expect(
++      inspectOwnedRuntime({
++        processOps: fakeProcessOps.ops,
++        userDataPath: tempDir.path,
++      }),
++    ).resolves.toMatchObject({ kind: "not-running" });
++  });
+ });
+diff --git a/packages/config/src/verified-process-stop.ts b/packages/config/src/verified-process-stop.ts
+index ef1a1ac2f6..6d44d4455e 100644
+--- a/packages/config/src/verified-process-stop.ts
++++ b/packages/config/src/verified-process-stop.ts
+@@ -107,14 +107,14 @@
+   };
+ }
+ 
+-interface VerifyProcessIdentityArgs {
++export interface VerifyProcessIdentityArgs {
+   pid: number;
+   processOps: VerifiedProcessOps;
+   startedAt: string;
+   verifyTokens: string[];
+ }
+ 
+-async function verifyProcessIdentity(
++export async function verifyProcessIdentity(
+   args: VerifyProcessIdentityArgs,
+ ): Promise<{ command: string | null; reason: UnverifiedReason } | null> {
+   const command = await args.processOps.readCommand(args.pid);
