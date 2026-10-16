@@ -31,3 +31,7 @@ bb plugin install . --yes
 ```
 
 Use the bundled `skills/browser-workbench/SKILL.md` for the native SDK/CLI interface. `patches/README.md` describes the native patch and its maintenance boundary. No update job, desktop restart or upstream publication is performed by installing this plugin.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The bundled desktop patches modify BB, which is also MIT licensed.

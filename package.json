@@ -51,5 +51,10 @@
     "build": "bb plugin build",
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/*.test.ts"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShamanicArts/bb-plugin-browser-workbench.git"
   }
 }
